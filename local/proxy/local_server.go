@@ -40,12 +40,15 @@ func serveProxyConn(conn net.Conn, proxy ProxyConfig) {
 	tryRemoteResolve := false
 	socksConn, bufconn, err := socks.NewSocksConn(conn)
 
+	//indicate that if remote opened by event
+	remoteOpened := false
+
 	socksInitProxy := func(addr string) {
 		if socksTargetHost == "127.0.0.1" {
 			proxyName := "Direct"
 			p = getProxyByName(proxyName)
 		} else {
-			creq, _ := http.NewRequest("Connect", addr, nil)
+			creq, _ := http.NewRequest("Connect", "https://"+addr, nil)
 			p = proxy.findProxyByRequest(protocol, socksTargetHost, creq)
 		}
 		if nil == p {
@@ -59,6 +62,7 @@ func serveProxyConn(conn net.Conn, proxy ProxyConfig) {
 		tcpOpen := &event.TCPOpenEvent{}
 		tcpOpen.SetId(sid)
 		tcpOpen.Addr = addr
+		remoteOpened = true
 		p.Serve(session, tcpOpen)
 	}
 
@@ -102,6 +106,14 @@ func serveProxyConn(conn net.Conn, proxy ProxyConfig) {
 	}
 	defer conn.Close()
 
+	testConn := func() {
+		if nil != p {
+			var testConnEv event.ConnTestEvent
+			testConnEv.SetId(sid)
+			p.Serve(session, &testConnEv)
+		}
+	}
+
 	go func() {
 		for !connClosed {
 			ev, err := queue.Read(1 * time.Second)
@@ -138,10 +150,23 @@ func serveProxyConn(conn net.Conn, proxy ProxyConfig) {
 	}
 	sniChunk := make([]byte, 0)
 	for !connClosed {
+		if remoteOpened {
+			conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		} else {
+			conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		}
 		if session.Hijacked {
 			buffer := make([]byte, 8192)
 			n, err := bufconn.Read(buffer)
 			if nil != err {
+				if helper.IsTimeoutError(err) {
+					if remoteOpened {
+						testConn()
+					} else {
+						socksInitProxy(net.JoinHostPort(socksTargetHost, socksTargetPort))
+					}
+					continue
+				}
 				if err != io.EOF && !connClosed {
 					log.Printf("Session:%d read chunk failed from proxy connection:%v", sid, err)
 				}
@@ -179,6 +204,10 @@ func serveProxyConn(conn net.Conn, proxy ProxyConfig) {
 		}
 		req, err := http.ReadRequest(bufconn)
 		if nil != err {
+			if helper.IsTimeoutError(err) {
+				testConn()
+				continue
+			}
 			if err != io.EOF && !connClosed {
 				if len(socksTargetHost) > 0 {
 					log.Printf("Session:%d read request failed from proxy connection to %s:%s for reason:%v", sid, socksTargetHost, socksTargetPort, err)
@@ -210,7 +239,7 @@ func serveProxyConn(conn net.Conn, proxy ProxyConfig) {
 				}
 			}
 		}
-		//log.Printf("[%s]Session:%d request:%s %v", p.Name(), sid, req.Method, reqUrl)
+		log.Printf("Session:%d request:%s %v", sid, req.Method, reqUrl)
 
 		req.Header.Del("Proxy-Connection")
 		ev := event.NewHTTPRequestEvent(req)
@@ -240,6 +269,7 @@ func serveProxyConn(conn net.Conn, proxy ProxyConfig) {
 		}
 
 		p.Serve(session, ev)
+		remoteOpened = true
 		if maxBody < 0 && req.ContentLength != 0 {
 			for nil != req.Body {
 				buffer := make([]byte, 8192)
@@ -271,7 +301,7 @@ func serveProxyConn(conn net.Conn, proxy ProxyConfig) {
 			}
 		}
 		if strings.EqualFold(req.Method, "Connect") && (session.SSLHijacked || session.Hijacked) {
-			conn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
+			conn.Write([]byte("HTTP/1.0 200 Connection established\r\n\r\n"))
 		}
 
 		//do not parse http rquest next process,since it would upgrade to websocket/spdy/http2
